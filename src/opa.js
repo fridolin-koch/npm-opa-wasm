@@ -93,6 +93,9 @@ async function _load_policy(policy_wasm, memory) {
   const wasm = await WebAssembly.instantiate(policy_wasm, {
     env: {
       memory: memory,
+      opa_println: function (addr) {
+        console.log(addr2string(addr))
+      },
       opa_abort: function (addr) {
         throw addr2string(addr);
       },
