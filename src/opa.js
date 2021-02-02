@@ -1,8 +1,12 @@
 // Copyright 2018 The OPA Authors.  All rights reserved.
 // Use of this source code is governed by an Apache2
 // license that can be found in the LICENSE file.
-const builtIns = require("./builtins");
+const builtIns = require("./builtins/index");
+const utf8 = require('utf8');
 
+/**
+ * @param {WebAssembly.Memory} mem
+ */
 function stringDecoder(mem) {
   return function (addr) {
     const i8 = new Int8Array(mem.buffer);
@@ -14,12 +18,19 @@ function stringDecoder(mem) {
   };
 }
 
+/**
+ * Stringifies and loads an object into OPA's Memory
+ * @param {WebAssembly.Instance} wasmInstance
+ * @param {WebAssembly.Memory} memory
+ * @param {any} value
+ * @returns {number}
+ */
 function _loadJSON(wasmInstance, memory, value) {
   if (value === undefined) {
     throw "unable to load undefined value into memory";
   }
 
-  const str = JSON.stringify(value);
+  const str = utf8.encode(JSON.stringify(value));
   const rawAddr = wasmInstance.exports.opa_malloc(str.length);
   const buf = new Uint8Array(memory.buffer);
 
@@ -35,6 +46,13 @@ function _loadJSON(wasmInstance, memory, value) {
   return parsedAddr;
 }
 
+/**
+ * Dumps and parses a JSON object from OPA's Memory
+ * @param {WebAssembly.Instance} wasmInstance
+ * @param {WebAssembly.Memory} memory
+ * @param {number} addr
+ * @returns {object}
+ */
 function _dumpJSON(wasmInstance, memory, addr) {
   const rawAddr = wasmInstance.exports.opa_json_dump(addr);
   const buf = new Uint8Array(memory.buffer);
@@ -46,13 +64,19 @@ function _dumpJSON(wasmInstance, memory, addr) {
     s += String.fromCharCode(buf[idx++]);
   }
 
-  return JSON.parse(s);
+  return JSON.parse(utf8.decode(s));
 }
 
 const builtinFuncs = builtIns;
 
-// _builtinCall dispatches the built-in function. The built-in function
-// arguments are loaded from Wasm and back in using JSOn serialization.
+/**
+ * _builtinCall dispatches the built-in function. The built-in function
+ * arguments are loaded from Wasm and back in using JSON serialization.
+ * @param {WebAssembly.Instance} wasmInstance
+ * @param {WebAssembly.Memory} memory
+ * @param {{ [builtinId: number]: string }} builtins
+ * @param {string} builtin_id
+ */
 function _builtinCall(wasmInstance, memory, builtins, builtin_id) {
   const builtInName = builtins[builtin_id];
   const impl = builtinFuncs[builtInName];
@@ -80,12 +104,17 @@ function _builtinCall(wasmInstance, memory, builtins, builtin_id) {
   return _loadJSON(wasmInstance, memory, result);
 }
 
-// _load_policy can take in either an ArrayBuffer or WebAssembly.Module
-// as its first argument, and a WebAssembly.Memory for the second parameter.
-// It will return a Promise, depending on the input type the promise
-// resolves to both a compiled WebAssembly.Module and its first WebAssembly.Instance
-// or to the WebAssemblyInstance.
-async function _load_policy(policy_wasm, memory) {
+/**
+ * _loadPolicy can take in either an ArrayBuffer or WebAssembly.Module
+ * as its first argument, and a WebAssembly.Memory for the second parameter.
+ * It will return a Promise, depending on the input type the promise
+ * resolves to both a compiled WebAssembly.Module and its first WebAssembly.Instance
+ * or to the WebAssemblyInstance.
+ * @param {BufferSource | WebAssembly.Module} policy_wasm
+ * @param {WebAssembly.Memory} memory
+ * @returns {Promise<WebAssembly.WebAssemblyInstantiatedSource | WebAssembly.Instance>}
+ */
+async function _loadPolicy(policy_wasm, memory) {
   const addr2string = stringDecoder(memory);
 
   let env = {};
@@ -98,6 +127,9 @@ async function _load_policy(policy_wasm, memory) {
       },
       opa_abort: function (addr) {
         throw addr2string(addr);
+      },
+      opa_println: function (addr) {
+        console.log(addr2string(addr))
       },
       opa_builtin0: function (builtin_id, ctx) {
         return _builtinCall(env.instance, memory, env.builtins, builtin_id);
@@ -141,12 +173,15 @@ async function _load_policy(policy_wasm, memory) {
     },
   });
 
+  env.instance = wasm.instance ? wasm.instance : wasm;
+
   const builtins = _dumpJSON(
-    wasm.instance,
+    env.instance,
     memory,
-    wasm.instance.exports.builtins(),
+    env.instance.exports.builtins(),
   );
-  env.instance = wasm.instance;
+
+  /** @type {typeof builtIns} */
   env.builtins = {};
 
   for (var key of Object.keys(builtins)) {
@@ -156,10 +191,17 @@ async function _load_policy(policy_wasm, memory) {
   return wasm;
 }
 
-// LoadedPolicy is a wrapper around a WebAssembly.Instance and WebAssembly.Memory
-// for a compiled Rego policy. There are helpers to run the wasm instance and
-// handle the output from the policy wasm.
+/**
+ * LoadedPolicy is a wrapper around a WebAssembly.Instance and WebAssembly.Memory
+ * for a compiled Rego policy. There are helpers to run the wasm instance and
+ * handle the output from the policy wasm.
+ */
 class LoadedPolicy {
+  /**
+   * Loads and initializes a compiled Rego policy.
+   * @param {WebAssembly.WebAssemblyInstantiatedSource} policy
+   * @param {WebAssembly.Memory} memory
+   */
   constructor(policy, memory) {
     this.mem = memory;
 
@@ -170,18 +212,18 @@ class LoadedPolicy {
 
     this.dataAddr = _loadJSON(this.wasmInstance, this.mem, {});
     this.baseHeapPtr = this.wasmInstance.exports.opa_heap_ptr_get();
-    this.baseHeapTop = this.wasmInstance.exports.opa_heap_top_get();
     this.dataHeapPtr = this.baseHeapPtr;
-    this.dataHeapTop = this.baseHeapTop;
   }
 
-  // evaluate will evaluate the loaded policy with the given input and
-  // return the result set. This should be re-used for multiple evaluations
-  // of the same policy with different inputs.
+  /**
+   * Evaluates the loaded policy with the given input and
+   * return the result set. This should be re-used for multiple evaluations
+   * of the same policy with different inputs.
+   * @param {object} input
+   */
   evaluate(input) {
     // Reset the heap pointer before each evaluation
     this.wasmInstance.exports.opa_heap_ptr_set(this.dataHeapPtr);
-    this.wasmInstance.exports.opa_heap_top_set(this.dataHeapTop);
 
     // Load the input data
     const inputAddr = _loadJSON(this.wasmInstance, this.mem, input);
@@ -201,31 +243,38 @@ class LoadedPolicy {
     return _dumpJSON(this.wasmInstance, this.mem, resultAddr);
   }
 
-  // eval_bool will evaluate the policy and return a boolean answer
-  // depending on the return code from the policy evaluation.
-  // Deprecated: Use `evaluate` instead.
-  eval_bool(input) {
+  /**
+   * eval_bool will evaluate the policy and return a boolean answer
+   * depending on the return code from the policy evaluation.
+   * @deprecated Use `evaluate` instead.
+   * @param {object} input
+   */
+  evalBool(input) {
     const rs = this.evaluate(input);
     return rs && rs.length === 1 && rs[0] === true;
   }
 
-  // set_data will load data for use in subsequent evaluations.
-  set_data(data) {
+  /**
+   * Loads data for use in subsequent evaluations.
+   * @param {object} data
+   */
+  setData(data) {
     this.wasmInstance.exports.opa_heap_ptr_set(this.baseHeapPtr);
-    this.wasmInstance.exports.opa_heap_top_set(this.baseHeapTop);
     this.dataAddr = _loadJSON(this.wasmInstance, this.mem, data);
     this.dataHeapPtr = this.wasmInstance.exports.opa_heap_ptr_get();
-    this.dataHeapTop = this.wasmInstance.exports.opa_heap_top_get();
   }
 }
 
-module.exports = class Rego {
-  // load_policy can take in either an ArrayBuffer or WebAssembly.Module
-  // and will return a LoadedPolicy object which can be used to evaluate
-  // the policy.
-  async load_policy(wasm) {
+module.exports = {
+  /**
+   * Takes in either an ArrayBuffer or WebAssembly.Module
+   * and will return a LoadedPolicy object which can be used to evaluate
+   * the policy.
+   * @param {BufferSource | WebAssembly.Module} regoWasm
+   */
+  async loadPolicy(regoWasm) {
     const memory = new WebAssembly.Memory({ initial: 5 });
-    const policy = await _load_policy(wasm, memory);
+    const policy = await _loadPolicy(regoWasm, memory);
     return new LoadedPolicy(policy, memory);
   }
-};
+}
